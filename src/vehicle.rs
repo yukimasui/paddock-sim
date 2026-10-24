@@ -100,16 +100,22 @@ impl Default for VehicleParams {
             cg_height: 0.46,
             front_track: 1.52,
             rear_track: 1.55,
-            front_roll_stiffness_share: 0.65,
+            front_roll_stiffness_share: 0.6,
             load_transfer_time_constant: 0.08,
-            front_tire: TireParams::default(),
-            // Wider rear tires: stiffer in cornering and a little more grip.
-            rear_tire: TireParams {
-                cornering_stiffness_ratio: 20.0,
-                peak_friction: 1.07,
+            // Summer performance tires (Michelin Pilot Sport 4 class).
+            front_tire: TireParams {
+                cornering_stiffness_ratio: 22.0,
+                peak_friction: 1.12,
                 ..default()
             },
-            max_brake_force: 12_500.0,
+            // Same size at the rear, but stiffer in cornering and a little
+            // grippier there for stability.
+            rear_tire: TireParams {
+                cornering_stiffness_ratio: 24.0,
+                peak_friction: 1.14,
+                ..default()
+            },
+            max_brake_force: 14_000.0,
             front_brake_bias: 0.72,
             drag_area: 0.6,
             steering_ratio: 15.0,
@@ -132,22 +138,22 @@ impl VehicleParams {
             cg_height: 0.45,
             front_track: 1.58,
             rear_track: 1.57,
-            front_roll_stiffness_share: 0.6,
+            front_roll_stiffness_share: 0.58,
             front_tire: TireParams {
                 nominal_load: 3500.0,
-                peak_friction: 1.1,
+                peak_friction: 1.15,
                 load_sensitivity: 0.12,
-                cornering_stiffness_ratio: 19.0,
+                cornering_stiffness_ratio: 23.0,
                 ..defaults.front_tire
             },
             rear_tire: TireParams {
                 nominal_load: 4000.0,
-                peak_friction: 1.12,
+                peak_friction: 1.18,
                 load_sensitivity: 0.12,
-                cornering_stiffness_ratio: 22.0,
+                cornering_stiffness_ratio: 26.0,
                 ..defaults.rear_tire
             },
-            max_brake_force: 17_000.0,
+            max_brake_force: 19_000.0,
             front_brake_bias: 0.65,
             drag_area: 0.62,
             ..defaults
@@ -1236,5 +1242,19 @@ mod tests {
             (3.0..7.0).contains(&(flat - uphill)),
             "flat {flat:.1} m/s, uphill {uphill:.1} m/s"
         );
+    }
+
+    #[test]
+    fn brz_corners_at_about_one_g_like_the_real_car() {
+        // Car and Driver measured 1.00 g on the skidpad for the GR86 on
+        // Michelin Pilot Sport 4 tires.
+        let params = VehicleParams::default();
+        let speed = 15.0;
+        let best = (1..40)
+            .map(|k| steady_turn_with(&params, speed, k as f32 * 0.005))
+            .filter(|v| v.speed() > speed * 0.9)
+            .map(|v| v.acceleration.y.abs() / GRAVITY)
+            .fold(0.0, f32::max);
+        assert!((0.95..1.05).contains(&best), "skidpad {best:.2} g");
     }
 }
