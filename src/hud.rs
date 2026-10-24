@@ -8,12 +8,13 @@ use bevy::prelude::*;
 use bevy::text::FontSize;
 
 use crate::audio::EngineAudio;
-use crate::engine::REDLINE_RPM;
+use crate::car::SelectedCar;
+use crate::course::SelectedCourse;
 use crate::ffb::ForceFeedback;
 use crate::powertrain::ShiftMode;
 use crate::surface::Surface;
-use crate::track::LapTimer;
-use crate::vehicle::{FRONT_LEFT, FRONT_RIGHT, REAR_LEFT, REAR_RIGHT, Vehicle, WheelSurfaces};
+use crate::track::{LapTimer, Track};
+use crate::vehicle::{FRONT_LEFT, FRONT_RIGHT, Ground, REAR_LEFT, REAR_RIGHT, Vehicle};
 use crate::wheel::{Pedals, Steering};
 
 const HUD_LAYER: usize = 1;
@@ -235,7 +236,7 @@ fn update_info_text(
          FFB: {ffb_state}  strength {:.0}% (F: toggle, Left/Right, hold T: test)\n\
          Column torque: {:+5.1} N m   Output: {:+5.1}%{}   Friction: {:4.1}%\n\
          R: reset to start   C: camera   -/=: zoom\n\
-         Paddles or E/Q: shift   A: automatic   M: mute",
+         Paddles or E/Q: shift   A: automatic   V: traction control   M: mute   Esc: change car",
         steering.angle_deg(),
         steering.rotation_range_deg,
         pedals.throttle * 100.0,
@@ -263,18 +264,29 @@ fn update_info_text(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_lap_text(
+    car: Res<SelectedCar>,
+    course: Res<SelectedCourse>,
+    track: Res<Track>,
     timer: Res<LapTimer>,
     vehicle: Res<Vehicle>,
     audio: Res<EngineAudio>,
-    surfaces: Res<WheelSurfaces>,
+    ground: Res<Ground>,
     mut text: Single<&mut Text, With<LapText>>,
 ) {
-    let lap = match timer.current {
-        Some(time) => format!("Lap {}  {}", timer.laps + 1, format_lap_time(Some(time))),
-        None => "Out lap".to_owned(),
+    let lap = match (timer.current, track.closed()) {
+        (Some(time), true) => format!("Lap {}  {}", timer.laps + 1, format_lap_time(Some(time))),
+        (Some(time), false) => format!("Run  {}", format_lap_time(Some(time))),
+        (None, true) => "Out lap".to_owned(),
+        (None, false) if timer.finished => "Finished (R to restart)".to_owned(),
+        (None, false) => "Ready".to_owned(),
     };
-    let off_track = surfaces.0.iter().filter(|&&s| s == Surface::GRASS).count();
+    let off_track = ground
+        .surfaces
+        .iter()
+        .filter(|&&s| s == Surface::GRASS)
+        .count();
     let warning = if off_track > 0 {
         format!("\n{off_track} wheel(s) off track")
     } else {
@@ -282,16 +294,30 @@ fn update_lap_text(
     };
     let powertrain = &vehicle.powertrain;
     let rpm = powertrain.engine.rpm;
-    let redline = if rpm >= REDLINE_RPM { " REDLINE" } else { "" };
+    let redline = if rpm >= powertrain.engine.spec.redline_rpm {
+        " REDLINE"
+    } else {
+        ""
+    };
     let lockup = if powertrain.lockup > 0.0 { " L" } else { "" };
     let mute = if audio.muted() { " (muted, M)" } else { "" };
+    let traction = &vehicle.traction_control;
+    let traction = if !traction.enabled {
+        "\nTC OFF"
+    } else if traction.intervening() {
+        "\nTC"
+    } else {
+        ""
+    };
     let mode = match powertrain.mode {
         ShiftMode::Manual => "M",
         ShiftMode::Automatic => "D",
     };
     let gear = powertrain.gear + 1;
     text.0 = format!(
-        "{lap}\nLast  {}\nBest  {}\n{mode}{gear}{lockup}  {rpm:.0} rpm{redline}{mute}{warning}",
+        "{}\n{}\n{lap}\nLast  {}\nBest  {}\n{mode}{gear}{lockup}  {rpm:.0} rpm{redline}{mute}{traction}{warning}",
+        car.0.spec().name,
+        course.0.spec().name,
         format_lap_time(timer.last),
         format_lap_time(timer.best),
     );

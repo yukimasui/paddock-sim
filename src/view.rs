@@ -10,8 +10,9 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use bevy::prelude::*;
 
+use crate::track::Track;
 use crate::vehicle::{
-    FRONT_LEFT, FRONT_RIGHT, REAR_LEFT, REAR_RIGHT, Vehicle, VehicleParams, WheelSurfaces,
+    FRONT_LEFT, FRONT_RIGHT, Ground, REAR_LEFT, REAR_RIGHT, Vehicle, VehicleParams,
 };
 
 const FIELD_OF_VIEW_DEG: f32 = 60.0;
@@ -111,7 +112,8 @@ impl Default for CameraSettings {
 /// Recent CG positions in meters, oldest first.
 #[derive(Resource, Default)]
 struct Trail {
-    points: VecDeque<Vec2>,
+    /// Ground-plane position and road height, m.
+    points: VecDeque<(Vec2, f32)>,
     since_last: f32,
 }
 
@@ -240,13 +242,32 @@ fn wheel_offsets(params: &VehicleParams) -> [Vec3; 4] {
     offsets
 }
 
+/// Road height under the car, m, and the car's pitch (nose up) and roll
+/// (left side up) from the slope, rad.
+fn ground_pose(track: &Track, vehicle: &Vehicle) -> (f32, f32, f32) {
+    let location = track.locate(vehicle.position);
+    let slope = track.slope_at(location);
+    let forward = vehicle.forward();
+    (
+        track.elevation_at(location),
+        slope.dot(forward).atan(),
+        slope.dot(forward.perp()).atan(),
+    )
+}
+
 fn place_car(
+    track: Res<Track>,
     vehicle: Res<Vehicle>,
     mut car: Single<&mut Transform, With<CarModel>>,
     mut body: Single<&mut Transform, (With<CarBody>, Without<CarModel>)>,
 ) {
-    car.translation = to_world(vehicle.position, 0.0);
-    car.rotation = heading_rotation(vehicle.heading);
+    let (height, pitch, roll) = ground_pose(&track, &vehicle);
+    car.translation = to_world(vehicle.position, height);
+    // In the model's frame +X is forward and +Z is right, so a positive
+    // turn about Z lifts the nose and one about X lifts the left side.
+    car.rotation = heading_rotation(vehicle.heading)
+        * Quat::from_rotation_z(pitch)
+        * Quat::from_rotation_x(roll);
 
     // Lean with the (lagged) accelerations that drive load transfer: roll
     // towards the outside of a turn, nose down under braking.
@@ -284,7 +305,7 @@ fn turn_wheels(
 fn color_tires(
     vehicle: Res<Vehicle>,
     params: Res<VehicleParams>,
-    surfaces: Res<WheelSurfaces>,
+    ground: Res<Ground>,
     tire_materials: Res<TireMaterials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -294,7 +315,7 @@ fn color_tires(
         } else {
             &params.rear_tire
         };
-        let tire = tire.with_grip(surfaces.0[wheel].grip);
+        let tire = tire.with_grip(ground.surfaces[wheel].grip);
         let load = vehicle.wheel_loads[wheel];
         let force = vehicle.tire_forces[wheel];
         let usage = if load > 0.0 {
@@ -324,6 +345,7 @@ fn adjust_camera(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<CameraSet
 
 fn follow_vehicle(
     time: Res<Time>,
+    track: Res<Track>,
     vehicle: Res<Vehicle>,
     mut settings: ResMut<CameraSettings>,
     mut camera: Single<&mut Transform, With<WorldCamera>>,
@@ -338,7 +360,8 @@ fn follow_vehicle(
     settings.heading = Some(heading);
 
     let forward = to_world(Vec2::from_angle(heading), 0.0);
-    let car = to_world(vehicle.position, 0.0);
+    let (height, _, _) = ground_pose(&track, &vehicle);
+    let car = to_world(vehicle.position, height);
     **camera = if settings.chase {
         let eye =
             car - forward * CHASE_DISTANCE * settings.zoom + Vec3::Y * CHASE_HEIGHT * settings.zoom;
@@ -356,12 +379,17 @@ fn wrap_angle(angle: f32) -> f32 {
     (angle + PI).rem_euclid(TAU) - PI
 }
 
-fn record_trail(time: Res<Time>, vehicle: Res<Vehicle>, mut trail: ResMut<Trail>) {
+fn record_trail(
+    time: Res<Time>,
+    track: Res<Track>,
+    vehicle: Res<Vehicle>,
+    mut trail: ResMut<Trail>,
+) {
     // A reset teleports the car; don't connect the old path to the new spot.
     if trail
         .points
         .back()
-        .is_some_and(|last| last.distance(vehicle.position) > 20.0)
+        .is_some_and(|(last, _)| last.distance(vehicle.position) > 20.0)
     {
         trail.points.clear();
     }
@@ -371,7 +399,8 @@ fn record_trail(time: Res<Time>, vehicle: Res<Vehicle>, mut trail: ResMut<Trail>
         return;
     }
     trail.since_last = 0.0;
-    trail.points.push_back(vehicle.position);
+    let (height, _, _) = ground_pose(&track, &vehicle);
+    trail.points.push_back((vehicle.position, height));
     if trail.points.len() > TRAIL_LENGTH {
         trail.points.pop_front();
     }
@@ -379,20 +408,24 @@ fn record_trail(time: Res<Time>, vehicle: Res<Vehicle>, mut trail: ResMut<Trail>
 
 fn draw_trail(trail: Res<Trail>, mut gizmos: Gizmos) {
     gizmos.linestrip(
-        trail.points.iter().map(|&p| to_world(p, LINE_HEIGHT)),
+        trail
+            .points
+            .iter()
+            .map(|&(p, height)| to_world(p, height + LINE_HEIGHT)),
         Color::srgb(0.3, 0.5, 0.8),
     );
 }
 
 /// Velocity of the CG on the ground; its angle to the body is the vehicle slip angle.
-fn draw_velocity(vehicle: Res<Vehicle>, mut gizmos: Gizmos) {
+fn draw_velocity(track: Res<Track>, vehicle: Res<Vehicle>, mut gizmos: Gizmos) {
     let forward = vehicle.forward();
     let world_velocity = forward * vehicle.velocity.x + forward.perp() * vehicle.velocity.y;
+    let (height, _, _) = ground_pose(&track, &vehicle);
     gizmos.arrow(
-        to_world(vehicle.position, LINE_HEIGHT),
+        to_world(vehicle.position, height + LINE_HEIGHT),
         to_world(
             vehicle.position + world_velocity * VELOCITY_ARROW_TIME,
-            LINE_HEIGHT,
+            height + LINE_HEIGHT,
         ),
         Color::srgb(0.3, 0.85, 0.4),
     );

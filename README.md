@@ -4,8 +4,20 @@ A driving simulator in Rust and [Bevy](https://bevy.org), built around a real
 steering wheel and pedals. Tires, force feedback, drivetrain and engine sound
 are all modelled from physics rather than canned effects.
 
-The first car is the Subaru BRZ / Toyota GR86 (FA24 2.4 L flat-four, Aisin
-six-speed automatic). More cars are planned.
+Two cars are available, chosen from a menu at start-up:
+
+- Subaru BRZ / Toyota GR86: FA24 2.4 L flat-four, Aisin six-speed automatic.
+- Lexus LFA: 1LR-GUE 4.8 L V10, six-speed sequential.
+
+The cars are drawn with the same simple body; their chassis, engine,
+gearbox and engine sound are their own. More cars are planned.
+
+Two courses:
+
+- A 2 km test circuit.
+- Nihondaira Parkway in Shizuoka, Japan: a 6.5 km point-to-point hill
+  climb rebuilt from OpenStreetMap road geometry and Geospatial
+  Information Authority of Japan (GSI) elevation data.
 
 This is a personal project. It runs on Linux and has been tested with a MOZA
 R12 wheel base and CRP2 pedals.
@@ -35,9 +47,16 @@ R12 wheel base and CRP2 pedals.
   - Cabin: separate airborne, intake and structure-borne paths into the
     cabin, with cabin modes and a short reverb.
   - Extras: road and wind noise, and an Active Sound Control layer.
-- **Track**: a 2 km circuit with asphalt, curbs and grass under each wheel
-  separately, plus lap timing.
+- **Courses**: asphalt, curbs and grass under each wheel separately; lap
+  timing on the circuit and start-to-finish timing on the hill climb. Road
+  slopes pull the car and tilt it.
+- **Driver aids**: traction and stability control trim engine torque before
+  the rear tires run out of grip.
 - **3D chase camera**, with a top-down view as an alternative.
+- **Shift lights** on a MOZA steering wheel's RPM LEDs. They fill up
+  towards the shift point and flash there. They are driven over the wheel
+  base's serial port, using the protocol as reverse-engineered by
+  [Boxflat](https://github.com/Lawstorant/boxflat).
 
 ## Requirements
 
@@ -57,6 +76,19 @@ R12 wheel base and CRP2 pedals.
 Set the in-game steering rotation range (Up/Down) to match the one in MOZA
 Pit House. The default is 900°.
 
+The shift lights need read and write access to the base's serial port,
+`/dev/serial/by-id/*MOZA*Base*`. This udev rule grants it to the
+logged-in user:
+
+```sh
+echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="346e", TAG+="uaccess"' \
+  | sudo tee /etc/udev/rules.d/70-moza-serial.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Close Boxflat or Pit House while driving, as they use the same port. The
+game works without the shift lights if the port isn't available.
+
 ## Running
 
 ```sh
@@ -70,9 +102,12 @@ the start, so rest your hands lightly on the wheel when launching.
 
 | Input | Action |
 | --- | --- |
+| Click an option, or 1 / 2 | Choose a car, then a course |
+| Esc | Back to the car menu |
 | Wheel, throttle, brake | Drive |
 | Right / left paddle, or E / Q | Shift up / down (manual mode) |
 | A | Automatic mode (the paddles return to manual) |
+| V | Traction and stability control on / off |
 | R | Reset to the start line |
 | C | Chase or top-down camera |
 | - / = | Zoom out / in |
@@ -86,7 +121,12 @@ the start, so rest your hands lightly on the wheel when launching.
 
 | Path | Contents |
 | --- | --- |
+| `src/menu.rs` | Car and course menus |
+| `src/car.rs` | Car definitions |
+| `src/course.rs`, `src/courses/` | Course definitions and imported course data |
+| `tools/import_osm_course.py` | Builds course data from OpenStreetMap and GSI elevation |
 | `src/wheel.rs` | evdev input: steering, pedals, paddles |
+| `src/shift_lights.rs` | MOZA wheel RPM LEDs over the serial port |
 | `src/ffb.rs` | Force feedback output thread and torque mapping |
 | `src/vehicle.rs` | Vehicle dynamics |
 | `src/tire.rs` | Tire model |
@@ -95,7 +135,7 @@ the start, so rest your hands lightly on the wheel when launching.
 | `src/powertrain.rs` | Torque converter, gearbox and shift logic |
 | `src/engine_sound/` | Engine sound synthesis (source, exhaust waveguides, cabin) |
 | `src/audio.rs` | Audio output via cpal |
-| `src/track.rs` | Circuit geometry, surfaces, rendering, lap timing |
+| `src/track.rs` | Course geometry, elevation, surfaces, rendering, timing |
 | `src/view.rs` | 3D scene, car model and camera |
 | `src/hud.rs` | On-screen telemetry and wheel and pedal display |
 
@@ -119,11 +159,22 @@ To hear the engine sound offline, render a scripted drive to a WAV file:
 ENGINE_PREVIEW=engine.wav cargo test render_preview -- --ignored
 ```
 
+Add `ENGINE_PREVIEW_CAR=lfa` for the LFA.
+
 ## Roadmap
 
-- More cars, such as the Lexus LFA's V10.
+- More cars, and per-car chassis and body.
 - Wheel spin and lock-up (wheel rotation and slip ratio).
 - Curb rumble in the force feedback.
+
+## Map data
+
+Course data in `src/courses/` is derived from OpenStreetMap
+(© OpenStreetMap contributors) and is available under the
+[Open Database License](https://opendatacommons.org/licenses/odbl/).
+Elevations come from the Geospatial Information Authority of Japan
+(国土地理院) elevation data. To rebuild or add a course, fetch the road with
+an Overpass API query and run `tools/import_osm_course.py`; see its header.
 
 ## References
 

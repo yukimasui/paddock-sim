@@ -101,6 +101,13 @@ impl Pipe {
 /// Scattering at a junction of pipes. `arriving` holds each branch's
 /// arriving wave and cross-section; returns the wave leaving into each.
 pub fn scatter<const N: usize>(arriving: [(f32, f32); N]) -> [f32; N] {
+    let mut leaving = [0.0; N];
+    scatter_into(&arriving, &mut leaving);
+    leaving
+}
+
+/// [`scatter`] for a junction whose branch count is only known at run time.
+pub fn scatter_into(arriving: &[(f32, f32)], leaving: &mut [f32]) {
     let total_area: f32 = arriving.iter().map(|&(_, area)| area).sum();
     let junction_pressure = 2.0
         * arriving
@@ -108,7 +115,9 @@ pub fn scatter<const N: usize>(arriving: [(f32, f32); N]) -> [f32; N] {
             .map(|&(wave, area)| wave * area)
             .sum::<f32>()
         / total_area;
-    arriving.map(|(wave, _)| junction_pressure - wave)
+    for (out, &(wave, _)) in leaving.iter_mut().zip(arriving) {
+        *out = junction_pressure - wave;
+    }
 }
 
 #[cfg(test)]

@@ -1,9 +1,14 @@
 mod audio;
+mod car;
+mod course;
+mod courses;
 mod engine;
 mod engine_sound;
 mod ffb;
 mod hud;
+mod menu;
 mod powertrain;
+mod shift_lights;
 mod surface;
 mod tire;
 mod track;
@@ -16,6 +21,8 @@ use bevy::prelude::*;
 use audio::EngineAudioPlugin;
 use ffb::FfbPlugin;
 use hud::HudPlugin;
+use menu::MenuPlugin;
+use shift_lights::ShiftLightsPlugin;
 use track::TrackPlugin;
 use vehicle::VehiclePlugin;
 use view::ViewPlugin;
@@ -31,6 +38,7 @@ fn main() {
             ..default()
         }))
         .add_plugins((
+            MenuPlugin,
             WheelPlugin,
             VehiclePlugin,
             TrackPlugin,
@@ -38,6 +46,7 @@ fn main() {
             ViewPlugin,
             HudPlugin,
             EngineAudioPlugin,
+            ShiftLightsPlugin,
         ))
         .insert_resource(ClearColor(Color::srgb(0.55, 0.7, 0.88)))
         .run();

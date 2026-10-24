@@ -15,6 +15,7 @@ use std::f32::consts::FRAC_PI_2;
 
 use bevy::prelude::*;
 
+use crate::menu::GameState;
 #[cfg(test)]
 use crate::powertrain::ShiftMode;
 use crate::powertrain::{Powertrain, WHEEL_RADIUS};
@@ -29,6 +30,17 @@ const AIR_DENSITY: f32 = 1.225;
 /// Lower bound on the rolling speed used to compute steady-state slip.
 const MIN_ROLLING_SPEED: f32 = 0.01;
 
+/// Traction control keeps the driven tires' combined use of their grip
+/// below this share, leaving about half of the sideways grip for cornering.
+const TRACTION_TARGET: f32 = 0.85;
+/// Stability control steps in once the rear tires slip this much more than
+/// the fronts (rad), the start of power oversteer.
+const OVERSTEER_THRESHOLD: f32 = 0.01;
+/// How hard it cuts torque per radian of excess oversteer, per second.
+const OVERSTEER_CUT_RATE: f32 = 400.0;
+/// Time for traction control to hand back full engine torque, s.
+const TRACTION_RECOVERY: f32 = 0.3;
+
 /// Indices into per-wheel arrays.
 pub const FRONT_LEFT: usize = 0;
 pub const FRONT_RIGHT: usize = 1;
@@ -42,9 +54,12 @@ impl Plugin for VehiclePlugin {
         app.insert_resource(Time::<Fixed>::from_hz(PHYSICS_HZ))
             .init_resource::<VehicleParams>()
             .init_resource::<Vehicle>()
-            .init_resource::<WheelSurfaces>()
-            .add_systems(FixedUpdate, step_vehicle)
-            .add_systems(Update, shift_on_request);
+            .init_resource::<Ground>()
+            .add_systems(
+                FixedUpdate,
+                step_vehicle.run_if(in_state(GameState::Driving)),
+            )
+            .add_systems(Update, (shift_on_request, toggle_traction_control));
     }
 }
 
@@ -104,6 +119,41 @@ impl Default for VehicleParams {
 }
 
 impl VehicleParams {
+    /// The Lexus LFA's chassis: heavier, with a front-mid V10 and a rear
+    /// transaxle for a 48:52 weight split, wide tires (265 front, 305
+    /// rear) and carbon-ceramic brakes. The body drawn is still the shared one.
+    pub fn lfa() -> Self {
+        let defaults = Self::default();
+        Self {
+            mass: 1480.0,
+            yaw_inertia: 2500.0,
+            cg_to_front_axle: 1.355,
+            cg_to_rear_axle: 1.25,
+            cg_height: 0.45,
+            front_track: 1.58,
+            rear_track: 1.57,
+            front_roll_stiffness_share: 0.6,
+            front_tire: TireParams {
+                nominal_load: 3500.0,
+                peak_friction: 1.1,
+                load_sensitivity: 0.12,
+                cornering_stiffness_ratio: 19.0,
+                ..defaults.front_tire
+            },
+            rear_tire: TireParams {
+                nominal_load: 4000.0,
+                peak_friction: 1.12,
+                load_sensitivity: 0.12,
+                cornering_stiffness_ratio: 22.0,
+                ..defaults.rear_tire
+            },
+            max_brake_force: 17_000.0,
+            front_brake_bias: 0.65,
+            drag_area: 0.62,
+            ..defaults
+        }
+    }
+
     pub fn wheelbase(&self) -> f32 {
         self.cg_to_front_axle + self.cg_to_rear_axle
     }
@@ -170,6 +220,61 @@ pub struct Vehicle {
     pub rear_lateral_slip: f32,
     /// Engine and automatic gearbox driving the rear wheels.
     pub powertrain: Powertrain,
+    pub traction_control: TractionControl,
+}
+
+/// Traction and stability control: trims engine torque when the driven
+/// tires near the end of their grip, or when the rear starts to slide wider
+/// than the front, as both cars' systems do.
+#[derive(Clone, Copy, Debug)]
+pub struct TractionControl {
+    pub enabled: bool,
+    /// Share of engine torque currently allowed, 0..=1.
+    pub torque_limit: f32,
+}
+
+impl Default for TractionControl {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            torque_limit: 1.0,
+        }
+    }
+}
+
+impl TractionControl {
+    /// Adjusts the torque allowed next step from the `drive` force the rear
+    /// tires are being asked for, the `lateral` force they already carry and
+    /// their total `grip` (N).
+    /// `oversteer` is how much more the rear tires slip than the fronts, rad.
+    fn update(&mut self, drive: f32, lateral: f32, grip: f32, oversteer: f32, dt: f32) {
+        if !self.enabled {
+            self.torque_limit = 1.0;
+            return;
+        }
+        if drive <= 0.0 || grip <= 0.0 {
+            self.torque_limit = (self.torque_limit + dt / TRACTION_RECOVERY).min(1.0);
+            return;
+        }
+        let mut limit = if drive.hypot(lateral) > TRACTION_TARGET * grip {
+            // Allow only the drive that keeps the combined use on target.
+            let allowed = ((TRACTION_TARGET * grip).powi(2) - lateral * lateral)
+                .max(0.0)
+                .sqrt();
+            self.torque_limit * allowed / drive
+        } else {
+            self.torque_limit + dt / TRACTION_RECOVERY
+        };
+        if oversteer > OVERSTEER_THRESHOLD {
+            limit -= OVERSTEER_CUT_RATE * (oversteer - OVERSTEER_THRESHOLD) * dt;
+        }
+        self.torque_limit = limit.clamp(0.0, 1.0);
+    }
+
+    /// True while it is holding torque back.
+    pub fn intervening(&self) -> bool {
+        self.torque_limit < 0.99
+    }
 }
 
 impl Default for Vehicle {
@@ -189,6 +294,7 @@ impl Default for Vehicle {
             front_lateral_slip: 0.0,
             rear_lateral_slip: 0.0,
             powertrain: Powertrain::default(),
+            traction_control: TractionControl::default(),
         }
     }
 }
@@ -254,14 +360,29 @@ fn sum_forces(a: TireForces, b: TireForces) -> TireForces {
     }
 }
 
-/// Surface under each wheel, indexed by `FRONT_LEFT` etc. Kept up to date
-/// by whatever owns the ground (the track).
+/// The ground under the car, kept up to date by whatever owns it (the track).
 #[derive(Resource, Clone, Copy, Debug)]
-pub struct WheelSurfaces(pub [Surface; 4]);
+pub struct Ground {
+    /// Surface under each wheel, indexed by `FRONT_LEFT` etc.
+    pub surfaces: [Surface; 4],
+    /// Slope as a gradient on the ground plane: how much the ground rises
+    /// per metre east and north.
+    pub slope: Vec2,
+}
 
-impl Default for WheelSurfaces {
+impl Default for Ground {
     fn default() -> Self {
-        Self([Surface::ASPHALT; 4])
+        Self::on(Surface::ASPHALT)
+    }
+}
+
+impl Ground {
+    /// Level ground with every wheel on `surface`.
+    pub fn on(surface: Surface) -> Self {
+        Self {
+            surfaces: [surface; 4],
+            slope: Vec2::ZERO,
+        }
     }
 }
 
@@ -291,6 +412,14 @@ fn shift_on_request(
     }
 }
 
+/// V switches traction control on and off.
+fn toggle_traction_control(keys: Res<ButtonInput<KeyCode>>, mut vehicle: ResMut<Vehicle>) {
+    if keys.just_pressed(KeyCode::KeyV) {
+        let control = &mut vehicle.traction_control;
+        control.enabled = !control.enabled;
+    }
+}
+
 /// Driver inputs for one physics step.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Controls {
@@ -305,7 +434,7 @@ pub fn step_vehicle(
     params: Res<VehicleParams>,
     pedals: Res<Pedals>,
     steering: Res<Steering>,
-    surfaces: Res<WheelSurfaces>,
+    ground: Res<Ground>,
     mut vehicle: ResMut<Vehicle>,
 ) {
     let controls = Controls {
@@ -313,18 +442,13 @@ pub fn step_vehicle(
         brake: pedals.brake,
         road_wheel_angle: steering.angle_deg().to_radians() / params.steering_ratio,
     };
-    vehicle.integrate(&params, controls, surfaces.0, time.delta_secs());
+    vehicle.integrate(&params, controls, *ground, time.delta_secs());
 }
 
 impl Vehicle {
-    /// Advances the state by `dt` seconds with each wheel on `surfaces`.
-    pub fn integrate(
-        &mut self,
-        p: &VehicleParams,
-        controls: Controls,
-        surfaces: [Surface; 4],
-        dt: f32,
-    ) {
+    /// Advances the state by `dt` seconds on `ground`.
+    pub fn integrate(&mut self, p: &VehicleParams, controls: Controls, ground: Ground, dt: f32) {
+        let surfaces = ground.surfaces;
         let a = p.cg_to_front_axle;
         let b = p.cg_to_rear_axle;
 
@@ -345,18 +469,28 @@ impl Vehicle {
 
         // The rear wheels roll with the car (there is no wheel spin model),
         // so they turn at the rear axle's rolling speed.
+        self.powertrain.engine.torque_limit = self.traction_control.torque_limit;
         let mut drive = self.powertrain.update(
             controls.throttle,
             controls.brake,
             rear_rolling / WHEEL_RADIUS,
             dt,
         ) / WHEEL_RADIUS;
+        // Gravity pulls the car down the slope: for road grades the
+        // downhill acceleration is g times the grade.
+        let forward = self.forward();
+        let downhill = -GRAVITY * ground.slope;
+        let mut gravity_x = p.mass * downhill.dot(forward);
+        let gravity_y = p.mass * downhill.dot(forward.perp());
         // Brakes and rolling resistance oppose the direction of travel. At a
-        // standstill the brakes hold the car against drive torque, such as
-        // the torque converter's creep, up to their capacity.
+        // standstill the brakes hold the car against drive torque (such as
+        // the torque converter's creep) and the slope, up to their capacity.
         let travel_direction = if vx != 0.0 { vx.signum() } else { 0.0 };
-        if travel_direction == 0.0 && drive.abs() <= controls.brake * p.max_brake_force {
+        if travel_direction == 0.0
+            && (drive + gravity_x).abs() <= controls.brake * p.max_brake_force
+        {
             drive = 0.0;
+            gravity_x = 0.0;
         }
         let brake = travel_direction * controls.brake * p.max_brake_force;
         let front_request = -brake * p.front_brake_bias * 0.5;
@@ -401,6 +535,19 @@ impl Vehicle {
         let front = sum_forces(tires[FRONT_LEFT], tires[FRONT_RIGHT]);
         let rear = sum_forces(tires[REAR_LEFT], tires[REAR_RIGHT]);
 
+        let rear_grip: f32 = [REAR_LEFT, REAR_RIGHT]
+            .into_iter()
+            .map(|wheel| tire_on(wheel).friction(loads[wheel]) * loads[wheel])
+            .sum();
+        // Oversteer: the rear sliding wider than the front, in the same direction.
+        let oversteer = if front_slip * rear_slip >= 0.0 {
+            rear_slip.abs() - front_slip.abs()
+        } else {
+            rear_slip.abs()
+        };
+        self.traction_control
+            .update(drive, rear.lateral, rear_grip, oversteer, dt);
+
         let rolling_resistance: f32 = (0..4)
             .map(|wheel| loads[wheel] * surfaces[wheel].rolling_resistance)
             .sum();
@@ -412,8 +559,10 @@ impl Vehicle {
         // and the tires' aligning torques also turn the car.
         let force_x = rear.longitudinal + front.longitudinal * cos_delta
             - front.lateral * sin_delta
-            - resistance;
-        let force_y = rear.lateral + front.lateral * cos_delta + front.longitudinal * sin_delta;
+            - resistance
+            + gravity_x;
+        let force_y =
+            rear.lateral + front.lateral * cos_delta + front.longitudinal * sin_delta + gravity_y;
         let longitudinal_imbalance = (tires[FRONT_RIGHT].longitudinal
             - tires[FRONT_LEFT].longitudinal)
             * p.front_track
@@ -438,8 +587,13 @@ impl Vehicle {
         let new_vy = vy + (force_y / p.mass - vx * r) * dt;
         let new_r = r + yaw_moment / p.yaw_inertia * dt;
 
-        // Acceleration felt by the body (specific force in the vehicle frame).
-        self.acceleration = Vec2::new((new_vx - vx) / dt - vy * r, force_y / p.mass);
+        // Acceleration felt by the body (specific force in the vehicle
+        // frame), which leaves out gravity; on a slope, this is what shifts
+        // weight towards the downhill axle.
+        self.acceleration = Vec2::new(
+            (new_vx - vx) / dt - vy * r - gravity_x / p.mass,
+            (force_y - gravity_y) / p.mass,
+        );
         let lag = dt / (p.load_transfer_time_constant + dt);
         self.load_transfer_acceleration +=
             (self.acceleration - self.load_transfer_acceleration) * lag;
@@ -535,7 +689,7 @@ mod tests {
     ) {
         for _ in 0..(seconds / DT) as usize {
             let c = controls(vehicle);
-            vehicle.integrate(params, c, [Surface::ASPHALT; 4], DT);
+            vehicle.integrate(params, c, Ground::default(), DT);
         }
     }
 
@@ -552,11 +706,16 @@ mod tests {
         vehicle
     }
 
-    /// A car cruising straight at `speed`, in a matching gear.
+    /// A car cruising straight at `speed`, in a matching gear. Driver aids
+    /// are off, so tests of the chassis see its own behaviour.
     fn moving_at(speed: f32) -> Vehicle {
         Vehicle {
             velocity: Vec2::new(speed, 0.0),
             powertrain: Powertrain::cruising(speed / WHEEL_RADIUS),
+            traction_control: TractionControl {
+                enabled: false,
+                ..default()
+            },
             ..default()
         }
     }
@@ -802,7 +961,7 @@ mod tests {
                 brake: if elapsed > 4.0 { 1.0 } else { 0.0 },
                 road_wheel_angle: 0.12,
             };
-            vehicle.integrate(&params, controls, [Surface::ASPHALT; 4], DT);
+            vehicle.integrate(&params, controls, Ground::default(), DT);
             elapsed += DT;
             worst = worst.max((vehicle.yaw_rate - before).abs() / DT);
         }
@@ -835,7 +994,7 @@ mod tests {
                 throttle: hold_speed(&vehicle, 20.0),
                 ..default()
             };
-            vehicle.integrate(&params, controls, [Surface::ASPHALT; 4], DT);
+            vehicle.integrate(&params, controls, Ground::default(), DT);
             worst = worst.max((vehicle.acceleration.y - before).abs() / DT);
         }
         assert!(worst < 1000.0, "lateral jerk {worst:.0} m/s^3");
@@ -908,7 +1067,7 @@ mod tests {
                     road_wheel_angle: 0.1,
                     ..default()
                 };
-                vehicle.integrate(&params, controls, [surface; 4], DT);
+                vehicle.integrate(&params, controls, Ground::on(surface), DT);
                 peak = peak.max(vehicle.acceleration.y.abs());
             }
             peak / GRAVITY
@@ -965,6 +1124,117 @@ mod tests {
             vehicle.speed() < drag_only - 0.3,
             "in gear {:.2} m/s, drag only {drag_only:.2} m/s",
             vehicle.speed()
+        );
+    }
+
+    /// The LFA at rest, in automatic, with traction control on or off.
+    fn lfa(traction_control: bool) -> (VehicleParams, Vehicle) {
+        use crate::engine::ONE_LR_GUE;
+        use crate::powertrain::LFA_6_SPEED;
+        let params = VehicleParams::lfa();
+        let mut vehicle = Vehicle {
+            powertrain: Powertrain::new(&ONE_LR_GUE, &LFA_6_SPEED),
+            wheel_loads: params.wheel_loads(Vec2::ZERO),
+            ..default()
+        };
+        vehicle.powertrain.mode = ShiftMode::Automatic;
+        vehicle.traction_control.enabled = traction_control;
+        (params, vehicle)
+    }
+
+    /// Floors it from rest with a touch of steering; returns the peak yaw
+    /// rate (rad/s) and the time to 100 km/h, if reached.
+    fn floor_it(params: &VehicleParams, vehicle: &mut Vehicle) -> (f32, Option<f32>) {
+        let mut peak_yaw: f32 = 0.0;
+        let mut to_100 = None;
+        for step in 0..(8.0 / DT) as usize {
+            let controls = Controls {
+                throttle: 1.0,
+                road_wheel_angle: 0.005,
+                ..default()
+            };
+            vehicle.integrate(params, controls, Ground::default(), DT);
+            peak_yaw = peak_yaw.max(vehicle.yaw_rate.abs());
+            if to_100.is_none() && vehicle.speed_kmh() >= 100.0 {
+                to_100 = Some(step as f32 * DT);
+            }
+        }
+        (peak_yaw, to_100)
+    }
+
+    #[test]
+    fn traction_control_keeps_a_full_throttle_launch_in_line() {
+        let (params, mut vehicle) = lfa(true);
+        let (peak_yaw, to_100) = floor_it(&params, &mut vehicle);
+        // The touch of steering alone turns it at under 0.1 rad/s; a spin
+        // would be well over 1.
+        assert!(peak_yaw < 0.3, "yawed at {peak_yaw:.2} rad/s");
+        let to_100 = to_100.expect("never reached 100 km/h");
+        // The real LFA does 0-100 km/h in about 3.7 s.
+        assert!((3.0..5.5).contains(&to_100), "0-100 km/h in {to_100:.2} s");
+    }
+
+    #[test]
+    fn without_traction_control_the_lfa_spins_its_rear_tires_loose() {
+        let (params, mut vehicle) = lfa(false);
+        let (peak_yaw, _) = floor_it(&params, &mut vehicle);
+        assert!(peak_yaw > 0.5, "only yawed at {peak_yaw:.2} rad/s");
+    }
+
+    /// Ground rising `grade` (rise per metre) straight ahead of a car at
+    /// its default heading.
+    fn hill(grade: f32) -> Ground {
+        Ground {
+            slope: Vehicle::default().forward() * grade,
+            ..default()
+        }
+    }
+
+    #[test]
+    fn brakes_hold_the_car_on_a_hill() {
+        let params = VehicleParams::default();
+        let mut vehicle = Vehicle::default();
+        for _ in 0..3000 {
+            let controls = Controls {
+                brake: 0.6,
+                ..default()
+            };
+            vehicle.integrate(&params, controls, hill(0.15), DT);
+        }
+        assert_eq!(vehicle.position, Vec2::ZERO);
+    }
+
+    #[test]
+    fn off_the_brakes_a_steep_hill_rolls_the_car_back() {
+        // Too steep for the automatic's creep to hold.
+        let params = VehicleParams::default();
+        let mut vehicle = Vehicle::default();
+        for _ in 0..3000 {
+            vehicle.integrate(&params, Controls::default(), hill(0.25), DT);
+        }
+        assert!(vehicle.speed() < -0.5, "speed {:.2} m/s", vehicle.speed());
+    }
+
+    #[test]
+    fn climbing_a_hill_slows_the_acceleration() {
+        let params = VehicleParams::default();
+        let speed_after = |ground: Ground| {
+            let mut vehicle = automatic();
+            for _ in 0..5000 {
+                let controls = Controls {
+                    throttle: 1.0,
+                    ..default()
+                };
+                vehicle.integrate(&params, controls, ground, DT);
+            }
+            vehicle.speed()
+        };
+        let flat = speed_after(Ground::default());
+        let uphill = speed_after(hill(0.1));
+        // A 10 % grade takes about 1 m/s^2 off the acceleration.
+        assert!(
+            (3.0..7.0).contains(&(flat - uphill)),
+            "flat {flat:.1} m/s, uphill {uphill:.1} m/s"
         );
     }
 }

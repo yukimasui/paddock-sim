@@ -3,31 +3,50 @@
 //! cabin's low resonances and a short reverberation.
 //!
 //! - Exhaust noise is airborne: the body blocks it more the higher its
-//!   frequency (mass law), with a small leak through seals and glass.
-//! - Intake noise comes through the firewall, muffled.
+//!   frequency, with a small leak through seals and glass.
+//! - Intake noise comes through the firewall, muffled, unless the car pipes
+//!   it into the cabin on purpose (as the LFA's sound channel does).
 //! - Engine torque pulses shake the engine on its mounts, and the body
 //!   radiates the vibration (structure-borne); this is the low boom.
 //! - Mechanical ticks (injectors, valvetrain) leak through faintly.
+//!
+//! Below its first acoustic mode the closed cabin acts as a pressure
+//! chamber: the panels compress the air inside rather than radiate into
+//! open space, which lifts the bass (the "cabin gain" of car audio).
+//!
+//! The car's body is shared by every car for now, so the cabin itself, the
+//! road and the wind are fixed here; only the engine-side paths are per car.
 
 use super::filters::{Biquad, Noise, OnePoleHighPass, OnePoleLowPass};
 
-/// Path gains, set so that at 3000 rpm, half load and 60 km/h the exhaust
-/// leads, the structure-borne boom sits just below it, intake and road noise
-/// below that, and mechanical ticks are barely audible.
-const EXHAUST_GAIN: f32 = 180.0;
-/// Fraction of exhaust noise that leaks in unfiltered.
-const EXHAUST_LEAK: f32 = 0.05;
-const BODY_CUTOFF: f32 = 200.0;
-const INTAKE_GAIN: f32 = 4.5;
-const FIREWALL_CUTOFF: f32 = 500.0;
-const STRUCTURE_GAIN: f32 = 0.7;
-/// Engine mount and body panel resonances: (Hz, Q).
-const MOUNT_RESONANCES: [(f32, f32); 3] = [(40.0, 2.0), (75.0, 2.5), (130.0, 3.0)];
-const MECHANICAL_GAIN: f32 = 100.0;
-const ASC_GAIN: f32 = 1.4;
+/// How each engine source reaches the cabin of a particular car. Filters
+/// are (cutoff Hz, Q) second-order low-passes.
+#[derive(Debug)]
+pub struct CabinSpec {
+    pub exhaust_gain: f32,
+    /// Body transmission of airborne exhaust noise. With the tailpipe's
+    /// rising radiation it leaves the exhaust falling about 6 dB per octave
+    /// above the cutoff.
+    pub body_transmission: (f32, f32),
+    /// Fraction of exhaust noise leaking through seals and glass, and the
+    /// cutoff (Hz) of that leak.
+    pub exhaust_leak: (f32, f32),
+    pub intake_gain: f32,
+    /// Firewall (or sound channel) transmission of intake noise.
+    pub intake_transmission: (f32, f32),
+    pub structure_gain: f32,
+    /// Engine mounts and body panels pass the low part of the vibration,
+    /// with a broad resonance near the top of that range.
+    pub mount_transmission: (f32, f32),
+    pub mechanical_gain: f32,
+    /// Active Sound Control speaker level (zero for cars without it).
+    pub asc_gain: f32,
+}
+
 /// Active Sound Control speaker band, Hz.
 const ASC_BAND: (f32, f32) = (80.0, 600.0);
-
+/// Cabin pressure-chamber bass lift: shelf corner (Hz) and gain (dB).
+const CABIN_GAIN: (f32, f32) = (80.0, 10.0);
 /// Cabin modes: (Hz, Q, boost dB). The first is the front-to-back mode of a
 /// cabin about 1.9 m long.
 const CABIN_MODES: [(f32, f32, f32); 3] = [(90.0, 3.0, 5.0), (140.0, 3.0, 4.0), (210.0, 3.0, 3.0)];
@@ -35,11 +54,12 @@ const REVERB_TIME: f32 = 0.08; // s, RT60
 const REVERB_MIX: f32 = 0.2;
 
 /// Road noise at 100 km/h, and its growth with speed (power of speed ratio).
-const ROAD_GAIN: f32 = 0.14;
+const ROAD_GAIN: f32 = 0.1;
 const ROAD_EXPONENT: f32 = 1.5;
-/// Wind noise at 100 km/h; it grows much faster with speed.
-const WIND_GAIN: f32 = 0.09;
+/// Wind noise at 100 km/h; it grows much faster with speed. Band (Hz).
+const WIND_GAIN: f32 = 0.025;
 const WIND_EXPONENT: f32 = 2.5;
+const WIND_BAND: (f32, f32) = (400.0, 2500.0);
 const REFERENCE_SPEED: f32 = 100.0 / 3.6;
 
 const DC_BLOCK_HZ: f32 = 20.0;
@@ -58,13 +78,16 @@ pub struct CabinInputs {
 }
 
 pub struct Cabin {
-    body: OnePoleLowPass,
-    firewall: OnePoleLowPass,
-    mounts: [Biquad; 3],
+    spec: &'static CabinSpec,
+    body: Biquad,
+    leak: OnePoleLowPass,
+    intake_path: Biquad,
+    mounts: Biquad,
     asc_band: [Biquad; 2],
     road_band: Biquad,
     road_rumble: Biquad,
     wind_band: [Biquad; 2],
+    cabin_gain: Biquad,
     modes: [Biquad; 3],
     reverb: Reverb,
     dc_block: OnePoleHighPass,
@@ -72,11 +95,14 @@ pub struct Cabin {
 }
 
 impl Cabin {
-    pub fn new(sample_rate: f32) -> Self {
+    pub fn new(sample_rate: f32, spec: &'static CabinSpec) -> Self {
+        let low_pass = |(hz, q): (f32, f32)| Biquad::low_pass(sample_rate, hz, q);
         Self {
-            body: OnePoleLowPass::new(sample_rate, BODY_CUTOFF),
-            firewall: OnePoleLowPass::new(sample_rate, FIREWALL_CUTOFF),
-            mounts: MOUNT_RESONANCES.map(|(hz, q)| Biquad::band_pass(sample_rate, hz, q)),
+            spec,
+            body: low_pass(spec.body_transmission),
+            leak: OnePoleLowPass::new(sample_rate, spec.exhaust_leak.1),
+            intake_path: low_pass(spec.intake_transmission),
+            mounts: low_pass(spec.mount_transmission),
             asc_band: [
                 Biquad::high_pass(sample_rate, ASC_BAND.0, 0.7),
                 Biquad::low_pass(sample_rate, ASC_BAND.1, 0.7),
@@ -84,9 +110,10 @@ impl Cabin {
             road_band: Biquad::band_pass(sample_rate, 350.0, 0.8),
             road_rumble: Biquad::low_pass(sample_rate, 90.0, 0.7),
             wind_band: [
-                Biquad::high_pass(sample_rate, 700.0, 0.7),
-                Biquad::low_pass(sample_rate, 4000.0, 0.7),
+                Biquad::high_pass(sample_rate, WIND_BAND.0, 0.7),
+                Biquad::low_pass(sample_rate, WIND_BAND.1, 0.7),
             ],
+            cabin_gain: Biquad::low_shelf(sample_rate, CABIN_GAIN.0, CABIN_GAIN.1),
             modes: CABIN_MODES.map(|(hz, q, db)| Biquad::peaking(sample_rate, hz, q, db)),
             reverb: Reverb::new(sample_rate, REVERB_TIME),
             dc_block: OnePoleHighPass::new(sample_rate, DC_BLOCK_HZ),
@@ -95,17 +122,14 @@ impl Cabin {
     }
 
     pub fn process(&mut self, inputs: CabinInputs) -> f32 {
-        let exhaust =
-            EXHAUST_GAIN * (self.body.process(inputs.exhaust) + EXHAUST_LEAK * inputs.exhaust);
-        let intake = INTAKE_GAIN * self.firewall.process(inputs.intake);
-        let structure = STRUCTURE_GAIN
-            * self
-                .mounts
-                .iter_mut()
-                .map(|mount| mount.process(inputs.structure))
-                .sum::<f32>();
-        let mechanical = MECHANICAL_GAIN * inputs.mechanical;
-        let asc = ASC_GAIN
+        let spec = self.spec;
+        let exhaust = spec.exhaust_gain
+            * (self.body.process(inputs.exhaust)
+                + spec.exhaust_leak.0 * self.leak.process(inputs.exhaust));
+        let intake = spec.intake_gain * self.intake_path.process(inputs.intake);
+        let structure = spec.structure_gain * self.mounts.process(inputs.structure);
+        let mechanical = spec.mechanical_gain * inputs.mechanical;
+        let asc = spec.asc_gain
             * self
                 .asc_band
                 .iter_mut()
@@ -124,7 +148,9 @@ impl Cabin {
                 .iter_mut()
                 .fold(white, |signal, filter| filter.process(signal));
 
-        let mut cabin = exhaust + intake + structure + mechanical + asc + road + wind;
+        let mut cabin = self
+            .cabin_gain
+            .process(exhaust + intake + structure + mechanical + asc + road + wind);
         for mode in &mut self.modes {
             cabin = mode.process(cabin);
         }

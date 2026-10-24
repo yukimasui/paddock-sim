@@ -8,14 +8,14 @@
 
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::thread;
 
 use bevy::prelude::*;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
-use crate::engine::IDLE_RPM;
+use crate::car::{Car, SelectedCar};
 use crate::engine_sound::{EngineSound, SoundInputs};
 use crate::vehicle::{Vehicle, step_vehicle};
 
@@ -31,7 +31,7 @@ impl Plugin for EngineAudioPlugin {
 
         app.insert_resource(audio)
             .add_systems(FixedUpdate, send_engine_state.after(step_vehicle))
-            .add_systems(Update, toggle_mute);
+            .add_systems(Update, (send_selected_car, toggle_mute));
     }
 }
 
@@ -60,16 +60,19 @@ pub struct EngineAudio {
     load: SharedValue,
     throttle: SharedValue,
     speed: SharedValue,
+    /// Index into `Car::ALL` of the car whose engine to play.
+    car: Arc<AtomicUsize>,
     muted: Arc<AtomicBool>,
 }
 
 impl Default for EngineAudio {
     fn default() -> Self {
         Self {
-            rpm: SharedValue::new(IDLE_RPM),
+            rpm: SharedValue::new(Car::default().spec().engine.idle_rpm),
             load: SharedValue::new(0.0),
             throttle: SharedValue::new(0.0),
             speed: SharedValue::new(0.0),
+            car: Arc::new(AtomicUsize::new(0)),
             muted: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -79,6 +82,14 @@ impl EngineAudio {
     pub fn muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
     }
+}
+
+fn send_selected_car(selected: Res<SelectedCar>, audio: Res<EngineAudio>) {
+    let index = Car::ALL
+        .iter()
+        .position(|&car| car == selected.0)
+        .unwrap_or(0);
+    audio.car.store(index, Ordering::Relaxed);
 }
 
 fn send_engine_state(vehicle: Res<Vehicle>, audio: Res<EngineAudio>) {
@@ -138,15 +149,22 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate as f32;
     let smoothing = 1.0 - (-1.0 / (sample_rate * PARAMETER_SMOOTHING)).exp();
-    let mut sound = EngineSound::new(sample_rate);
+    let mut car = audio.car.load(Ordering::Relaxed);
+    let mut sound = EngineSound::new(sample_rate, Car::ALL[car].spec().sound);
     let mut smoothed = SoundInputs {
-        rpm: IDLE_RPM,
+        rpm: Car::ALL[car].spec().engine.idle_rpm,
         ..SoundInputs::default()
     };
 
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _| {
+            // A different car means a different engine and exhaust.
+            let selected = audio.car.load(Ordering::Relaxed);
+            if selected != car {
+                car = selected;
+                sound = EngineSound::new(sample_rate, Car::ALL[car].spec().sound);
+            }
             let target = SoundInputs {
                 rpm: audio.rpm.get(),
                 load: audio.load.get(),

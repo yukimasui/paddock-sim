@@ -1,5 +1,7 @@
-//! Engine, torque converter and six-speed automatic gearbox, modelled on the
-//! Aisin 6AT of the Subaru BRZ / Toyota GR86, driving the rear wheels.
+//! Engine, torque converter and six-speed gearbox driving the rear wheels,
+//! parameterised per car by a [`GearboxSpec`]. The model is a torque
+//! converter automatic like the Aisin 6AT of the Subaru BRZ / Toyota GR86;
+//! other cars reuse it with their own ratios and shift points.
 //!
 //! The torque converter lets the engine run faster than the gearbox input
 //! (turbine) and multiplies torque while it slips, so the car can pull away
@@ -17,18 +19,80 @@
 
 use std::f32::consts::TAU;
 
-use crate::engine::Engine;
+use crate::engine::{Engine, EngineSpec, FA24};
 
-/// Gear ratios, first to sixth.
-pub const GEAR_RATIOS: [f32; 6] = [3.538, 2.060, 1.404, 1.000, 0.713, 0.582];
-pub const FINAL_DRIVE: f32 = 4.100;
-/// Rolling radius of the 215/40R18 rear tires, m.
+/// What distinguishes one gearbox and its calibration from another. Speeds
+/// are in rpm.
+#[derive(Debug)]
+pub struct GearboxSpec {
+    /// Gear ratios, first to sixth.
+    pub ratios: [f32; 6],
+    pub final_drive: f32,
+    /// Speed at which the stalled converter absorbs the engine's peak torque.
+    pub stall_rpm: f32,
+    /// Lockup clutch torque capacity, N m.
+    pub lockup_capacity: f32,
+    /// Lowest turbine speed at which lockup engages.
+    pub lockup_min_rpm: f32,
+    /// Automatic shift points (turbine speed) with the pedal barely pressed
+    /// and floored. In between they follow the square of the pedal, so
+    /// gentle driving shifts up early.
+    pub upshift_rpm: (f32, f32),
+    pub downshift_rpm: (f32, f32),
+    /// The automatic shifts up regardless of the pedal above this, to
+    /// protect the engine.
+    pub over_rev_rpm: f32,
+    /// Extra downshift speed at full brake, so the automatic works down
+    /// through the gears while braking for a corner.
+    pub braking_downshift_rpm: f32,
+    /// The automatic never shifts down into a gear that would put the engine
+    /// above this.
+    pub max_downshift_rpm: f32,
+    /// In manual, downshifts that would take the engine above this are refused.
+    pub manual_downshift_limit_rpm: f32,
+    /// In manual, shifts down by itself below this turbine speed.
+    pub manual_min_rpm: f32,
+}
+
+/// Aisin six-speed automatic of the Subaru BRZ / Toyota GR86.
+pub static AISIN_6AT: GearboxSpec = GearboxSpec {
+    ratios: [3.538, 2.060, 1.404, 1.000, 0.713, 0.582],
+    final_drive: 4.100,
+    stall_rpm: 2500.0,
+    lockup_capacity: 450.0,
+    lockup_min_rpm: 1300.0,
+    upshift_rpm: (1600.0, 6900.0),
+    downshift_rpm: (1100.0, 4200.0),
+    over_rev_rpm: 7100.0,
+    braking_downshift_rpm: 2200.0,
+    max_downshift_rpm: 6300.0,
+    manual_downshift_limit_rpm: 7200.0,
+    manual_min_rpm: 1000.0,
+};
+
+/// Lexus LFA six-speed sequential, with approximate published ratios (not
+/// verified). The real car uses a single-clutch automated manual; here it
+/// is driven through the same converter model, recalibrated for the V10.
+pub static LFA_6_SPEED: GearboxSpec = GearboxSpec {
+    ratios: [3.231, 2.188, 1.609, 1.233, 0.970, 0.795],
+    final_drive: 4.083,
+    stall_rpm: 3200.0,
+    lockup_capacity: 750.0,
+    lockup_min_rpm: 1600.0,
+    upshift_rpm: (2000.0, 8800.0),
+    downshift_rpm: (1400.0, 5500.0),
+    over_rev_rpm: 9200.0,
+    braking_downshift_rpm: 3000.0,
+    max_downshift_rpm: 8000.0,
+    manual_downshift_limit_rpm: 9200.0,
+    manual_min_rpm: 1300.0,
+};
+
+/// Rolling radius of the rear tires (215/40R18), m. The chassis is shared
+/// by every car for now.
 pub const WHEEL_RADIUS: f32 = 0.31;
 const DRIVELINE_EFFICIENCY: f32 = 0.9;
 
-/// Impeller torque per rpm^2 with the turbine stalled: the engine's 250 N m
-/// is absorbed at a 2500 rpm stall speed.
-const CONVERTER_CAPACITY: f32 = 250.0 / (2500.0 * 2500.0);
 /// Torque multiplication with the turbine stalled.
 const STALL_TORQUE_RATIO: f32 = 2.0;
 /// Turbine/impeller speed ratio above which there is no torque multiplication.
@@ -38,32 +102,22 @@ const CAPACITY_EXPONENT: f32 = 6.0;
 /// The converter transmits less when the wheels drive the engine.
 const OVERRUN_CAPACITY_SCALE: f32 = 0.5;
 
-/// Lockup clutch torque per rad/s of slip, and its capacity, N m.
+/// Lockup clutch torque per rad/s of slip.
 const LOCKUP_STIFFNESS: f32 = 150.0;
-const LOCKUP_CAPACITY: f32 = 450.0;
 /// Time for the lockup clutch to reach full capacity, s.
 const LOCKUP_ENGAGE_TIME: f32 = 0.3;
-/// Lowest gear (index) and turbine speed (rpm) at which lockup engages.
+/// Lowest gear (index) in which lockup engages.
 const LOCKUP_MIN_GEAR: usize = 1;
-const LOCKUP_MIN_TURBINE_RPM: f32 = 1300.0;
 
-/// Shift points in turbine rpm, with the pedal barely pressed and floored.
-/// In between they follow the square of the pedal, so gentle driving
-/// shifts up early.
-const UPSHIFT_RPM: (f32, f32) = (1600.0, 6900.0);
-const DOWNSHIFT_RPM: (f32, f32) = (1100.0, 4200.0);
 /// Pedal position below which the driver counts as off the throttle, when
-/// the gearbox holds its gear instead of shifting up.
+/// the automatic holds its gear instead of shifting up.
 const UPSHIFT_MIN_PEDAL: f32 = 0.02;
-/// Shifts up regardless of the pedal above this, to protect the engine, rpm.
-const OVER_REV_RPM: f32 = 7100.0;
-/// Extra downshift speed at full brake, so the gearbox works down through
-/// the gears while braking for a corner, rpm.
-const BRAKING_DOWNSHIFT_RPM: f32 = 2200.0;
-/// Never shifts down into a gear that would put the engine above this, rpm.
-const MAX_DOWNSHIFT_RPM: f32 = 6300.0;
 /// After a shift: lockup stays open this long, s.
 const SHIFT_TIME: f32 = 0.35;
+/// Time over which a shift moves the ratio from the old gear to the new one,
+/// as the shift clutches slip and swap over, s. Changing the ratio instantly
+/// would slam the engine's inertia into the converter and the rear tires.
+const SHIFT_BLEND: f32 = 0.25;
 /// Minimum time between shifts, s.
 const SHIFT_INTERVAL: f32 = 0.8;
 /// Throttle the ECU blips to match revs on a downshift.
@@ -73,10 +127,6 @@ const DEMAND_LAG: f32 = 0.3;
 
 /// Minimum time between paddle shifts, s.
 const MANUAL_SHIFT_INTERVAL: f32 = 0.25;
-/// In manual, downshifts that would take the engine above this are refused, rpm.
-const MANUAL_DOWNSHIFT_LIMIT_RPM: f32 = 7200.0;
-/// In manual, shifts down by itself below this turbine speed, rpm.
-const MANUAL_MIN_RPM: f32 = 1000.0;
 /// Paddle pulls queued while a shift is still under way.
 const MAX_QUEUED_SHIFTS: i32 = 3;
 
@@ -91,7 +141,8 @@ pub enum ShiftMode {
 #[derive(Clone, Debug)]
 pub struct Powertrain {
     pub engine: Engine,
-    /// Index into `GEAR_RATIOS` (0 is first gear).
+    pub gearbox: &'static GearboxSpec,
+    /// Index into the gear ratios (0 is first gear).
     pub gear: usize,
     /// Lockup clutch engagement, 0 (open) ..= 1 (fully engaged).
     pub lockup: f32,
@@ -101,23 +152,31 @@ pub struct Powertrain {
     /// Smoothed pedal position used by the shift schedule.
     demand: f32,
     since_shift: f32,
+    /// Overall ratio when the current shift began.
+    shift_from_ratio: f32,
 }
 
 impl Default for Powertrain {
     fn default() -> Self {
+        Self::new(&FA24, &AISIN_6AT)
+    }
+}
+
+impl Powertrain {
+    pub fn new(engine: &'static EngineSpec, gearbox: &'static GearboxSpec) -> Self {
         Self {
-            engine: Engine::default(),
+            engine: Engine::new(engine),
+            gearbox,
             gear: 0,
             lockup: 0.0,
             mode: ShiftMode::Manual,
             queued_shifts: 0,
             demand: 0.0,
             since_shift: SHIFT_INTERVAL,
+            shift_from_ratio: gearbox.ratios[0] * gearbox.final_drive,
         }
     }
-}
 
-impl Powertrain {
     /// A powertrain already cruising with the driven wheels at `wheel_speed`
     /// (rad/s): in the gear the schedule picks at light throttle, locked up.
     #[cfg(test)]
@@ -127,12 +186,14 @@ impl Powertrain {
             ..Self::default()
         };
         powertrain.demand = 0.2;
-        powertrain.gear = (0..GEAR_RATIOS.len())
+        powertrain.gear = (0..powertrain.gearbox.ratios.len())
             .rev()
-            .find(|&gear| turbine_rpm(wheel_speed, gear) >= powertrain.downshift_rpm(0.0))
+            .find(|&gear| {
+                powertrain.turbine_rpm(wheel_speed, gear) >= powertrain.downshift_rpm(0.0)
+            })
             .unwrap_or(0);
-        let rpm = turbine_rpm(wheel_speed, powertrain.gear);
-        if powertrain.gear >= LOCKUP_MIN_GEAR && rpm > LOCKUP_MIN_TURBINE_RPM {
+        let rpm = powertrain.turbine_rpm(wheel_speed, powertrain.gear);
+        if powertrain.gear >= LOCKUP_MIN_GEAR && rpm > powertrain.gearbox.lockup_min_rpm {
             powertrain.lockup = 1.0;
             powertrain.engine.rpm = rpm;
         }
@@ -152,9 +213,25 @@ impl Powertrain {
         self.queued_shifts = 0;
     }
 
-    /// Overall ratio from engine (when locked) to wheels in the current gear.
+    /// Overall ratio from the gearbox input to the wheels: the current
+    /// gear's, or part way there while a shift is under way.
     pub fn ratio(&self) -> f32 {
-        GEAR_RATIOS[self.gear] * FINAL_DRIVE
+        let target = self.gearbox.ratios[self.gear] * self.gearbox.final_drive;
+        let progress = (self.since_shift / SHIFT_BLEND).clamp(0.0, 1.0);
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        self.shift_from_ratio + (target - self.shift_from_ratio) * eased
+    }
+
+    /// Starts a shift into `gear`.
+    fn engage(&mut self, gear: usize) {
+        self.shift_from_ratio = self.ratio();
+        self.gear = gear;
+        self.since_shift = 0.0;
+    }
+
+    /// Gearbox input speed in `gear` with the wheels at `wheel_speed` rad/s, rpm.
+    fn turbine_rpm(&self, wheel_speed: f32, gear: usize) -> f32 {
+        wheel_speed * self.gearbox.ratios[gear] * self.gearbox.final_drive * RAD_S_TO_RPM
     }
 
     /// Advances by `dt` seconds with the throttle and brake pedals at
@@ -169,17 +246,18 @@ impl Powertrain {
         let ratio = self.ratio();
         let turbine = wheel_speed * ratio;
         let engine = self.engine.angular_velocity();
-        let (impeller_torque, turbine_torque) = converter(engine, turbine);
+        let capacity = self.engine.peak_torque() / self.gearbox.stall_rpm.powi(2);
+        let (impeller_torque, turbine_torque) = converter(engine, turbine, capacity);
 
         let lockup_wanted = self.gear >= LOCKUP_MIN_GEAR
-            && turbine * RAD_S_TO_RPM > LOCKUP_MIN_TURBINE_RPM
+            && turbine * RAD_S_TO_RPM > self.gearbox.lockup_min_rpm
             && self.since_shift > SHIFT_TIME;
         self.lockup = if lockup_wanted {
             (self.lockup + dt / LOCKUP_ENGAGE_TIME).min(1.0)
         } else {
             0.0
         };
-        let capacity = LOCKUP_CAPACITY * self.lockup;
+        let capacity = self.gearbox.lockup_capacity * self.lockup;
         let lockup_torque = (LOCKUP_STIFFNESS * (engine - turbine)).clamp(-capacity, capacity);
 
         // On a downshift the ECU blips the throttle to bring the engine up
@@ -197,13 +275,15 @@ impl Powertrain {
     }
 
     fn upshift_rpm(&self) -> f32 {
-        UPSHIFT_RPM.0 + (UPSHIFT_RPM.1 - UPSHIFT_RPM.0) * self.demand.clamp(0.0, 1.0).powi(2)
+        let (light, floored) = self.gearbox.upshift_rpm;
+        light + (floored - light) * self.demand.clamp(0.0, 1.0).powi(2)
     }
 
     fn downshift_rpm(&self, brake: f32) -> f32 {
-        DOWNSHIFT_RPM.0
-            + (DOWNSHIFT_RPM.1 - DOWNSHIFT_RPM.0) * self.demand.clamp(0.0, 1.0).powi(2)
-            + BRAKING_DOWNSHIFT_RPM * brake.clamp(0.0, 1.0)
+        let (light, floored) = self.gearbox.downshift_rpm;
+        light
+            + (floored - light) * self.demand.clamp(0.0, 1.0).powi(2)
+            + self.gearbox.braking_downshift_rpm * brake.clamp(0.0, 1.0)
     }
 
     fn choose_gear(&mut self, pedal: f32, brake: f32, wheel_speed: f32) {
@@ -223,10 +303,13 @@ impl Powertrain {
             let Some(gear) = self.gear.checked_add_signed(step as isize) else {
                 return;
             };
-            let over_revs = step < 0 && turbine_rpm(wheel_speed, gear) > MANUAL_DOWNSHIFT_LIMIT_RPM;
-            if gear < GEAR_RATIOS.len() && !over_revs {
-                self.gear = gear;
-                self.since_shift = 0.0;
+            if gear >= self.gearbox.ratios.len() {
+                return;
+            }
+            let over_revs = step < 0
+                && self.turbine_rpm(wheel_speed, gear) > self.gearbox.manual_downshift_limit_rpm;
+            if !over_revs {
+                self.engage(gear);
             }
             return;
         }
@@ -234,10 +317,9 @@ impl Powertrain {
         // revs fall too low.
         if self.gear > 0
             && self.since_shift >= SHIFT_INTERVAL
-            && turbine_rpm(wheel_speed, self.gear) < MANUAL_MIN_RPM
+            && self.turbine_rpm(wheel_speed, self.gear) < self.gearbox.manual_min_rpm
         {
-            self.gear -= 1;
-            self.since_shift = 0.0;
+            self.engage(self.gear - 1);
         }
     }
 
@@ -245,41 +327,37 @@ impl Powertrain {
         if self.since_shift < SHIFT_INTERVAL {
             return;
         }
-        let rpm = turbine_rpm(wheel_speed, self.gear);
-        let top = GEAR_RATIOS.len() - 1;
+        let rpm = self.turbine_rpm(wheel_speed, self.gear);
+        let top = self.gearbox.ratios.len() - 1;
 
-        let wants_upshift =
-            (pedal > UPSHIFT_MIN_PEDAL && rpm > self.upshift_rpm()) || rpm > OVER_REV_RPM;
+        let wants_upshift = (pedal > UPSHIFT_MIN_PEDAL && rpm > self.upshift_rpm())
+            || rpm > self.gearbox.over_rev_rpm;
         let target = if wants_upshift && self.gear < top {
             Some(self.gear + 1)
         } else if rpm < self.downshift_rpm(brake) && self.gear > 0 {
             // Straight to the highest gear that gives enough revs (kickdown
             // can skip several), as long as the engine can take it.
             let down = self.downshift_rpm(brake);
-            let fits = |gear: usize| turbine_rpm(wheel_speed, gear) <= MAX_DOWNSHIFT_RPM;
+            let fits =
+                |gear: usize| self.turbine_rpm(wheel_speed, gear) <= self.gearbox.max_downshift_rpm;
             (0..self.gear)
                 .rev()
-                .find(|&gear| fits(gear) && turbine_rpm(wheel_speed, gear) >= down)
+                .find(|&gear| fits(gear) && self.turbine_rpm(wheel_speed, gear) >= down)
                 .or_else(|| fits(self.gear - 1).then_some(self.gear - 1))
         } else {
             None
         };
         if let Some(gear) = target {
-            self.gear = gear;
-            self.since_shift = 0.0;
+            self.engage(gear);
         }
     }
 }
 
-/// Gearbox input speed in `gear` with the wheels at `wheel_speed` rad/s, rpm.
-fn turbine_rpm(wheel_speed: f32, gear: usize) -> f32 {
-    wheel_speed * GEAR_RATIOS[gear] * FINAL_DRIVE * RAD_S_TO_RPM
-}
-
 /// Torque converter impeller and turbine torques (N m) for impeller (engine)
-/// and turbine speeds in rad/s. The impeller torque loads the engine; the
-/// turbine torque drives the gearbox.
-fn converter(impeller: f32, turbine: f32) -> (f32, f32) {
+/// and turbine speeds in rad/s, with `capacity` the impeller torque per rpm^2
+/// when stalled. The impeller torque loads the engine; the turbine torque
+/// drives the gearbox.
+fn converter(impeller: f32, turbine: f32, capacity: f32) -> (f32, f32) {
     if turbine <= impeller {
         // The engine drives. A turbine turning backwards counts as stalled.
         if impeller <= 0.0 {
@@ -287,7 +365,7 @@ fn converter(impeller: f32, turbine: f32) -> (f32, f32) {
         }
         let speed_ratio = (turbine / impeller).max(0.0);
         let rpm = impeller * RAD_S_TO_RPM;
-        let torque = CONVERTER_CAPACITY * (1.0 - speed_ratio.powf(CAPACITY_EXPONENT)) * rpm * rpm;
+        let torque = capacity * (1.0 - speed_ratio.powf(CAPACITY_EXPONENT)) * rpm * rpm;
         let multiplication = if speed_ratio < COUPLING_SPEED_RATIO {
             STALL_TORQUE_RATIO - (STALL_TORQUE_RATIO - 1.0) * speed_ratio / COUPLING_SPEED_RATIO
         } else {
@@ -299,7 +377,7 @@ fn converter(impeller: f32, turbine: f32) -> (f32, f32) {
         let speed_ratio = (impeller / turbine).max(0.0);
         let rpm = turbine * RAD_S_TO_RPM;
         let torque = -OVERRUN_CAPACITY_SCALE
-            * CONVERTER_CAPACITY
+            * capacity
             * (1.0 - speed_ratio.powf(CAPACITY_EXPONENT))
             * rpm
             * rpm;
@@ -310,14 +388,13 @@ fn converter(impeller: f32, turbine: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::IDLE_RPM;
 
     const DT: f32 = 0.001;
 
     #[test]
     fn stalled_converter_absorbs_full_torque_at_stall_speed() {
         let stall = 2500.0 / RAD_S_TO_RPM;
-        let (impeller, turbine) = converter(stall, 0.0);
+        let (impeller, turbine) = converter(stall, 0.0, 250.0 / 2500.0_f32.powi(2));
         assert!((impeller - 250.0).abs() < 1.0);
         assert!(
             (turbine - 500.0).abs() < 2.0,
@@ -327,7 +404,7 @@ mod tests {
 
     #[test]
     fn converter_transmits_nothing_at_equal_speeds() {
-        let (impeller, turbine) = converter(300.0, 300.0);
+        let (impeller, turbine) = converter(300.0, 300.0, 250.0 / 2500.0_f32.powi(2));
         assert!(impeller.abs() < 1e-3 && turbine.abs() < 1e-3);
     }
 
@@ -340,7 +417,7 @@ mod tests {
         }
         assert_eq!(powertrain.gear, 0);
         assert!(
-            (powertrain.engine.rpm - IDLE_RPM).abs() < 150.0,
+            (powertrain.engine.rpm - FA24.idle_rpm).abs() < 150.0,
             "idle {:.0}",
             powertrain.engine.rpm
         );
@@ -450,7 +527,7 @@ mod tests {
     fn manual_holds_the_gear_at_the_limiter() {
         let mut powertrain = Powertrain::default();
         // First gear at about 7000 rpm, foot flat: no automatic upshift.
-        let wheel_speed = 7000.0 / RAD_S_TO_RPM / (GEAR_RATIOS[0] * FINAL_DRIVE);
+        let wheel_speed = 7000.0 / RAD_S_TO_RPM / (AISIN_6AT.ratios[0] * AISIN_6AT.final_drive);
         for _ in 0..3000 {
             powertrain.update(1.0, 0.0, wheel_speed, DT);
         }
@@ -460,7 +537,7 @@ mod tests {
     #[test]
     fn manual_refuses_downshifts_that_would_over_rev() {
         // Third at 5500 rpm; second would be about 8070 rpm.
-        let wheel_speed = 5500.0 / RAD_S_TO_RPM / (GEAR_RATIOS[2] * FINAL_DRIVE);
+        let wheel_speed = 5500.0 / RAD_S_TO_RPM / (AISIN_6AT.ratios[2] * AISIN_6AT.final_drive);
         let mut powertrain = Powertrain {
             gear: 2,
             ..Powertrain::default()

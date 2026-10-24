@@ -48,6 +48,28 @@ impl Biquad {
         Self::from_coefficients([alpha, 0.0, -alpha], [1.0 + alpha, -2.0 * cos, 1.0 - alpha])
     }
 
+    /// Low shelf boosting (or cutting) `gain_db` below `corner`.
+    pub fn low_shelf(sample_rate: f32, corner: f32, gain_db: f32) -> Self {
+        let (cos, _) = Self::prewarp(sample_rate, corner, 1.0);
+        let a = 10f32.powf(gain_db / 40.0);
+        // Shelf slope 1: alpha = sin(w0) / sqrt(2).
+        let omega = TAU * corner / sample_rate;
+        let alpha = omega.sin() / std::f32::consts::SQRT_2;
+        let root = 2.0 * a.sqrt() * alpha;
+        Self::from_coefficients(
+            [
+                a * ((a + 1.0) - (a - 1.0) * cos + root),
+                2.0 * a * ((a - 1.0) - (a + 1.0) * cos),
+                a * ((a + 1.0) - (a - 1.0) * cos - root),
+            ],
+            [
+                (a + 1.0) + (a - 1.0) * cos + root,
+                -2.0 * ((a - 1.0) + (a + 1.0) * cos),
+                (a + 1.0) + (a - 1.0) * cos - root,
+            ],
+        )
+    }
+
     /// Peaking EQ boosting (or cutting) `gain_db` around `center`.
     pub fn peaking(sample_rate: f32, center: f32, q: f32, gain_db: f32) -> Self {
         let (cos, alpha) = Self::prewarp(sample_rate, center, q);
@@ -157,5 +179,34 @@ impl Noise {
         self.pink[1] = 0.963 * self.pink[1] + white * 0.296_516_4;
         self.pink[2] = 0.57 * self.pink[2] + white * 1.052_691_3;
         (self.pink[0] + self.pink[1] + self.pink[2] + white * 0.1848) * 0.25
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gain_at(filter: &mut Biquad, rate: f32, frequency: f32) -> f32 {
+        let samples = (rate * 0.5) as usize;
+        let mut energy_in = 0.0;
+        let mut energy_out = 0.0;
+        for n in 0..samples {
+            let x = (TAU * frequency * n as f32 / rate).sin();
+            let y = filter.process(x);
+            if n > samples / 2 {
+                energy_in += x * x;
+                energy_out += y * y;
+            }
+        }
+        10.0 * (energy_out / energy_in).log10()
+    }
+
+    #[test]
+    fn low_shelf_boosts_only_below_its_corner() {
+        let rate = 48_000.0;
+        let low = gain_at(&mut Biquad::low_shelf(rate, 80.0, 10.0), rate, 20.0);
+        let high = gain_at(&mut Biquad::low_shelf(rate, 80.0, 10.0), rate, 1000.0);
+        assert!((low - 10.0).abs() < 1.0, "boost {low:.1} dB");
+        assert!(high.abs() < 0.5, "above the corner {high:.1} dB");
     }
 }
